@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+dev.db
+tests/test.db
+*.log
+*.egg-info/
+.pytest_cache/
+
+# Firebase service account credentials - never commit these.
+*firebase-adminsdk*.json
