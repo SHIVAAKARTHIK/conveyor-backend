@@ -221,6 +221,76 @@ async def mark_arrived(
     return _to_out(delivery)
 
 
+@router.post("/{delivery_id}/receive", response_model=DeliveryOut)
+async def receive_delivery(
+    delivery_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.patient)),
+):
+    """The patient confirms their own medicine reached them - the web-only
+    replacement for the nurse's bedside QR scan (`/confirm`).
+
+    A patient can only confirm a delivery that is *theirs* and has already
+    *arrived*; anything else is refused, so the record can't be closed early
+    or by someone else."""
+    delivery = _get_delivery_or_404(db, delivery_id)
+    patient = _get_own_patient_or_404(db, current_user)
+    prescription = db.get(Prescription, delivery.prescription_id)
+    if prescription is None or prescription.patient_id != patient.id:
+        # Same answer as a missing delivery, so ids of other patients' deliveries aren't revealed.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found")
+    if delivery.status != DeliveryStatus.arrived:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Delivery is '{delivery.status.value}', expected 'arrived'",
+        )
+
+    delivery.status = DeliveryStatus.confirmed
+    delivery.confirmed_by = current_user.id
+    delivery.confirmed_at = datetime.utcnow()
+    db.add(delivery)
+
+    prescription.status = PrescriptionStatus.delivered
+    db.add(prescription)
+    db.commit()
+    db.refresh(delivery)
+
+    await manager.broadcast("conveyor", {"event": "confirmed", "delivery_id": delivery.id})
+    return _to_out(delivery)
+
+
+@router.post("/{delivery_id}/fail", response_model=DeliveryOut)
+async def fail_delivery(
+    delivery_id: str,
+    db: Session = Depends(get_db),
+    _staff: User = Depends(require_roles(UserRole.technician, UserRole.admin)),
+):
+    """Close a delivery that will not complete - an emergency stop, a box that
+    never reached its bed, or a leftover job. Without this a stopped run stays
+    'in transit' forever.
+
+    Only deliveries that are still open can be failed; one that already
+    arrived or was confirmed is a finished record and is left alone."""
+    delivery = _get_delivery_or_404(db, delivery_id)
+    if delivery.status not in (DeliveryStatus.preparing, DeliveryStatus.verifying, DeliveryStatus.in_transit):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Delivery is '{delivery.status.value}' and cannot be failed",
+        )
+
+    delivery.status = DeliveryStatus.failed
+    db.add(delivery)
+    prescription = db.get(Prescription, delivery.prescription_id)
+    if prescription is not None:
+        prescription.status = PrescriptionStatus.failed
+        db.add(prescription)
+    db.commit()
+    db.refresh(delivery)
+
+    await manager.broadcast("conveyor", {"event": "failed", "delivery_id": delivery.id})
+    return _to_out(delivery)
+
+
 @router.post("/{delivery_id}/confirm", response_model=DeliveryOut)
 async def confirm_delivery(
     delivery_id: str,

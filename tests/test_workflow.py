@@ -515,3 +515,100 @@ def test_conveyor_next_job_is_fifo(client):
     job2 = client.get("/conveyor/next-job", headers=auth_headers(station)).json()
     assert job2["bed_no"] == "2"
     assert job2["patient_name"] == "Second Patient"
+
+
+def _signup_patient(client, name, email, bed):
+    r = client.post(
+        "/auth/signup/patient",
+        json={"name": name, "age": 40, "gender": "Female", "bed_no": bed, "email": email, "password": "patientpass"},
+    )
+    assert r.status_code == 201, r.text
+    token = r.json()["access_token"]
+    patient_id = client.get("/patients/me", headers=auth_headers(token)).json()["id"]
+    return token, patient_id
+
+
+def _prescribe(client, doctor_token, patient_id):
+    r = client.post(
+        "/prescriptions",
+        headers=auth_headers(doctor_token),
+        json={
+            "patient_id": patient_id,
+            "medicines": [{"name": "Paracetamol", "dosage": "500mg", "form": "tablet", "qty": 2}],
+        },
+    )
+    assert r.status_code == 201, r.text
+
+
+def _staff_setup(client):
+    admin_token = login(client, "admin@medidispense.com", "admin123")
+    create_staff(client, admin_token, "doctor")
+    create_staff(client, admin_token, "technician")
+    return login(client, "doctor@medidispense.com"), login(client, "technician@medidispense.com")
+
+
+def test_patient_confirms_receipt_of_their_own_delivery(client):
+    """Web-only replacement for the nurse's QR scan: once the box has arrived,
+    the patient it was for can close the delivery - nobody else can, and not early."""
+    doctor, station = _staff_setup(client)
+    patient, patient_id = _signup_patient(client, "Receiver One", "r1@medidispense.com", "1")
+    other_patient, _ = _signup_patient(client, "Receiver Two", "r2@medidispense.com", "2")
+    _prescribe(client, doctor, patient_id)
+
+    job = client.get("/conveyor/next-job", headers=auth_headers(station)).json()
+    delivery_id = job["delivery_id"]
+    assert client.post(f"/deliveries/{delivery_id}/dispatch", headers=auth_headers(station)).status_code == 200
+
+    # Still on the belt: too early to confirm.
+    assert client.post(f"/deliveries/{delivery_id}/receive", headers=auth_headers(patient)).status_code == 409
+
+    assert client.post(f"/deliveries/{delivery_id}/mark-arrived", headers=auth_headers(station)).status_code == 200
+
+    # Another patient cannot confirm it (and does not learn it exists); staff are not patients.
+    assert client.post(f"/deliveries/{delivery_id}/receive", headers=auth_headers(other_patient)).status_code == 404
+    assert client.post(f"/deliveries/{delivery_id}/receive", headers=auth_headers(station)).status_code == 403
+
+    r = client.post(f"/deliveries/{delivery_id}/receive", headers=auth_headers(patient))
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "confirmed"
+    assert r.json()["confirmed_at"] is not None
+
+    # The prescription behind it is now delivered, and a second tap is refused.
+    prescriptions = client.get("/prescriptions", headers=auth_headers(doctor)).json()
+    assert [p["status"] for p in prescriptions] == ["delivered"]
+    assert client.post(f"/deliveries/{delivery_id}/receive", headers=auth_headers(patient)).status_code == 409
+
+
+def test_technician_can_fail_an_open_delivery(client):
+    """A stopped or abandoned run must be closeable, or it stays 'in transit' forever."""
+    doctor, station = _staff_setup(client)
+    patient, patient_id = _signup_patient(client, "Stuck Patient", "stuck@medidispense.com", "1")
+
+    # 1) A job nobody ever loaded: failing it removes it from the station's queue.
+    _prescribe(client, doctor, patient_id)
+    job = client.get("/conveyor/next-job", headers=auth_headers(station)).json()
+    assert client.post(f"/deliveries/{job['delivery_id']}/fail", headers=auth_headers(doctor)).status_code == 403
+    assert client.post(f"/deliveries/{job['delivery_id']}/fail", headers=auth_headers(patient)).status_code == 403
+    r = client.post(f"/deliveries/{job['delivery_id']}/fail", headers=auth_headers(station))
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "failed"
+    assert client.get("/conveyor/next-job", headers=auth_headers(station)).status_code == 204
+    assert client.post(f"/deliveries/{job['delivery_id']}/fail", headers=auth_headers(station)).status_code == 409
+
+    # 2) A run that was dispatched but stopped midway (emergency stop / timeout).
+    _prescribe(client, doctor, patient_id)
+    job2 = client.get("/conveyor/next-job", headers=auth_headers(station)).json()
+    client.post(f"/deliveries/{job2['delivery_id']}/dispatch", headers=auth_headers(station))
+    r = client.post(f"/deliveries/{job2['delivery_id']}/fail", headers=auth_headers(station))
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "failed"
+
+    # 3) A delivery that already arrived is a finished record and cannot be failed.
+    _prescribe(client, doctor, patient_id)
+    job3 = client.get("/conveyor/next-job", headers=auth_headers(station)).json()
+    client.post(f"/deliveries/{job3['delivery_id']}/dispatch", headers=auth_headers(station))
+    client.post(f"/deliveries/{job3['delivery_id']}/mark-arrived", headers=auth_headers(station))
+    assert client.post(f"/deliveries/{job3['delivery_id']}/fail", headers=auth_headers(station)).status_code == 409
+
+    statuses = sorted(p["status"] for p in client.get("/prescriptions", headers=auth_headers(doctor)).json())
+    assert statuses == ["dispatched", "failed", "failed"]
