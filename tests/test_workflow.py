@@ -612,3 +612,57 @@ def test_technician_can_fail_an_open_delivery(client):
 
     statuses = sorted(p["status"] for p in client.get("/prescriptions", headers=auth_headers(doctor)).json())
     assert statuses == ["dispatched", "failed", "failed"]
+
+
+def test_nurse_assigns_the_bed_and_prescribing_waits_for_it(client):
+    admin = login(client, "admin@medidispense.com", "admin123")
+    for role in ["doctor", "nurse", "technician"]:
+        create_staff(client, admin, role)
+    doctor = login(client, "doctor@medidispense.com")
+    nurse = login(client, "nurse@medidispense.com")
+    technician = login(client, "technician@medidispense.com")
+
+    # A patient signs up WITHOUT choosing a bed.
+    r = client.post(
+        "/auth/signup/patient",
+        json={"name": "No Bed Yet", "age": 61, "gender": "Male", "email": "nobed@example.com", "password": "patientpass"},
+    )
+    assert r.status_code == 201, r.text
+    patient_token = r.json()["access_token"]
+    patient = client.get("/patients/me", headers=auth_headers(patient_token)).json()
+    assert patient["bed_no"] == ""
+
+    rx = {"patient_id": patient["id"], "notes": "x", "medicines": [{"name": "Metformin", "dosage": "500mg", "form": "tablet", "qty": 1}]}
+
+    # No bed -> the doctor cannot prescribe yet.
+    r = client.post("/prescriptions", headers=auth_headers(doctor), json=rx)
+    assert r.status_code == 409
+    assert "bed" in r.json()["detail"].lower()
+
+    # Only a nurse (or admin) can assign; patient and doctor cannot, and only beds 1 and 2 exist.
+    for who in (patient_token, doctor, technician):
+        r = client.patch(f"/patients/{patient['id']}/bed", headers=auth_headers(who), json={"bed_no": "1"})
+        assert r.status_code == 403
+    r = client.patch(f"/patients/{patient['id']}/bed", headers=auth_headers(nurse), json={"bed_no": "7"})
+    assert r.status_code == 422
+    r = client.patch("/patients/does-not-exist/bed", headers=auth_headers(nurse), json={"bed_no": "1"})
+    assert r.status_code == 404
+
+    r = client.patch(f"/patients/{patient['id']}/bed", headers=auth_headers(nurse), json={"bed_no": "2"})
+    assert r.status_code == 200, r.text
+    assert r.json()["bed_no"] == "2"
+
+    # With a bed the prescription goes through and the conveyor routes it to that bed.
+    r = client.post("/prescriptions", headers=auth_headers(doctor), json=rx)
+    assert r.status_code == 201, r.text
+    job = client.get("/conveyor/next-job", headers=auth_headers(technician)).json()
+    assert job["bed_no"] == "2"
+
+    # Moving the patient while a box for them is on the belt is refused.
+    client.post(f"/deliveries/{job['delivery_id']}/dispatch", headers=auth_headers(technician))
+    r = client.patch(f"/patients/{patient['id']}/bed", headers=auth_headers(nurse), json={"bed_no": "1"})
+    assert r.status_code == 409
+    client.post(f"/deliveries/{job['delivery_id']}/mark-arrived", headers=auth_headers(technician))
+    r = client.patch(f"/patients/{patient['id']}/bed", headers=auth_headers(nurse), json={"bed_no": "1"})
+    assert r.status_code == 200
+    assert r.json()["bed_no"] == "1"

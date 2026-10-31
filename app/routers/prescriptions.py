@@ -48,6 +48,11 @@ async def create_prescription(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
     if not payload.medicines:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one medicine is required")
+    if not patient.bed_no.strip():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This patient has no bed yet - ask a nurse to assign one before prescribing",
+        )
 
     consultation = None
     if payload.consultation_id:

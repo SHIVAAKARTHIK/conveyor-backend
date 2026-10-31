@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr
 
@@ -35,12 +36,13 @@ class RegisterFcmTokenRequest(BaseModel):
 
 class PatientSignupRequest(BaseModel):
     """Public self-signup: creates a login account AND the linked Patient
-    record (with bed + QR) in one step - see POST /auth/signup/patient."""
+    record (with QR) in one step - see POST /auth/signup/patient. The bed is
+    normally left out: a nurse assigns it afterwards (PATCH /patients/{id}/bed)."""
 
     name: str
     age: int
     gender: str
-    bed_no: str
+    bed_no: str = ""
     email: EmailStr
     password: str
     phone: str | None = None
@@ -96,6 +98,12 @@ class PatientCreate(BaseModel):
     gender: str
     bed_no: str
     medical_history_notes: str | None = None
+
+
+class PatientBedAssign(BaseModel):
+    """The conveyor serves two beds, so only these are accepted here."""
+
+    bed_no: Literal["1", "2"]
 
 
 class PatientOut(BaseModel):

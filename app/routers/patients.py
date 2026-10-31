@@ -2,9 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Patient, User, UserRole
+from app.models import Delivery, DeliveryStatus, Patient, Prescription, User, UserRole
 from app.qr import qr_code_png_base64
-from app.schemas import PatientCreate, PatientOut
+from app.schemas import PatientBedAssign, PatientCreate, PatientOut
 from app.security import get_current_user, require_roles
 
 router = APIRouter(prefix="/patients", tags=["patients"])
@@ -75,6 +75,37 @@ def create_patient(
         medical_history_notes=payload.medical_history_notes,
         created_by=current_user.id,
     )
+    db.add(patient)
+    db.commit()
+    db.refresh(patient)
+    return patient
+
+
+@router.patch("/{patient_id}/bed", response_model=PatientOut)
+def assign_bed(
+    patient_id: str,
+    payload: PatientBedAssign,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_roles(UserRole.nurse, UserRole.admin)),
+):
+    """A nurse puts the patient in Bed 1 or Bed 2 (or moves them). The bed on the
+    record is what routes a delivery, so it cannot change while a box for that
+    patient is already on the belt."""
+    patient = db.get(Patient, patient_id)
+    if patient is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+    on_the_belt = (
+        db.query(Delivery)
+        .join(Prescription, Prescription.id == Delivery.prescription_id)
+        .filter(Prescription.patient_id == patient.id, Delivery.status == DeliveryStatus.in_transit)
+        .first()
+    )
+    if on_the_belt is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A delivery for this patient is on the belt right now - wait until it arrives",
+        )
+    patient.bed_no = payload.bed_no
     db.add(patient)
     db.commit()
     db.refresh(patient)
