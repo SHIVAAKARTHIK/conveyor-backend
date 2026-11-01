@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .env
 dev.db
+dev.db.backup-*
 tests/test.db
 *.log
 *.egg-info/
